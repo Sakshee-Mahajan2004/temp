@@ -1,13 +1,490 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
-</head>
-<body>
-    <h1>Hello</h1>
-    <h3>good afternoon</h3>
-    <h5>hello</h5>
-</body>
-</html>
+import React, { useState } from 'react';
+import { MonthlyHours, Candidate, IncentiveCycle, RetroactiveIncentive } from '../types';
+import { isCandidateMonthProcessed } from '../utils/calculations';
+import { Clock, Save, X, AlertCircle, Upload, Users, Edit } from 'lucide-react';
+import { FileUploadModal } from './FileUploadModal';
+import { useMutation } from '@tanstack/react-query';
+import { addHoursToIncentiveCycle } from '../network/incentiveCycleApi';
+
+interface CycleHoursFormProps {
+  cycle: IncentiveCycle;
+  candidates: Candidate[];
+  retroactiveIncentives?: RetroactiveIncentive[];
+  approvedCycles: IncentiveCycle[];
+  onSave: (cycle: IncentiveCycle, monthlyHours: MonthlyHours[]) => void;
+  onCancel: () => void;
+}
+
+export const CycleHoursForm: React.FC<CycleHoursFormProps> = ({
+  cycle,
+  candidates,
+  approvedCycles,
+  onSave,
+  onCancel
+}) => {
+  const [hoursData, setHoursData] = useState<{ [key: string]: number }>({});
+  const [originalHours, setOriginalHours] = useState<{ [key: string]: number }>({});
+  const [showManualEntry, setShowManualEntry] = useState(false);
+
+  const [showFileUpload, setShowFileUpload] = useState(false);
+  const [selectedMonth, setSelectedMonth] = useState(cycle.month);
+  const [searchTerm, setSearchTerm] = useState('');
+
+  // Initialize hours data from existing cycle hours
+  React.useEffect(() => {
+    const existing: { [key: string]: number } = {};
+    const original: { [key: string]: number } = {};
+
+    (cycle.monthlyHours ?? []).forEach(h => {
+      // Key by the actual month of the hours record, not the current cycle month
+      const key = `${h.candidateId}-${h.month}`;
+      existing[key] = h.hoursWorked;
+      original[key] = h.hoursWorked;
+    });
+
+    setHoursData(existing);
+    setOriginalHours(original);
+  }, [cycle.monthlyHours]);
+
+  const handleHoursChange = (candidateId: string, month: string, hours: number) => {
+    const key = `${candidateId}-${month}`;
+    setHoursData(prev => ({
+      ...prev,
+      [key]: hours
+    }));
+  };
+
+  const onAddHoursSuccess = (updatedCycle:any) => {
+    onSave(updatedCycle, updatedCycle.monthlyHours || []);    
+  }
+
+  const mutation = useMutation({
+    mutationFn: ({ cycleId, monthlyHours }: { cycleId: string; monthlyHours: any[] }) =>
+      addHoursToIncentiveCycle(cycleId, monthlyHours),
+    onSuccess: onAddHoursSuccess,
+    onError: (error: any) => {
+      alert('Failed to save hours: ' + (error?.message || 'Unknown error'));
+    },
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const monthlyHours: any[] = Object.entries(hoursData)
+      .filter(([_, hours]) => hours >= 0)
+      .map(([key, hours]) => {
+        const [candidateId, month] = key.split('-');
+        return {
+          candidateId,
+          month,
+          hoursWorked: hours,
+          isRetroactive: month !== cycle.month
+        };
+      });
+    mutation.mutate({ cycleId: cycle.id, monthlyHours });
+  };
+
+  const handleFileUploadSave = (uploadedCycleId: string, monthlyHours: MonthlyHours[]) => {
+    // Update local state with uploaded data
+    const newHoursData: { [key: string]: number } = {};
+    monthlyHours.forEach(h => {
+      const key = `${h.candidateId}-${h.month}`;
+      newHoursData[key] = h.hoursWorked;
+    });
+    setHoursData(prev => ({ ...prev, ...newHoursData }));
+    setShowFileUpload(false);
+  
+    // Trigger the save mutation with the uploaded hours
+    mutation.mutate({ 
+      cycleId: uploadedCycleId, 
+      monthlyHours: monthlyHours.map(h => ({
+        candidateId: h.candidateId,
+        month: h.month,
+        hoursWorked: h.hoursWorked,
+        isRetroactive: h.month !== cycle.month
+      }))
+    });
+  };
+
+  const formatMonth = (month: string) => {
+    const [year, monthNum] = month.split('-');
+    return new Date(parseInt(year), parseInt(monthNum) - 1).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'long'
+    });
+  };
+
+  // Helpers for month traversal and pending detection
+  const addMonths = (ym: string, delta: number): string => {
+    const [y, m] = ym.split('-').map(v => parseInt(v, 10));
+    const date = new Date(y, m - 1, 1);
+    date.setMonth(date.getMonth() + delta);
+    const yy = date.getFullYear();
+    const mm = (date.getMonth() + 1).toString().padStart(2, '0');
+    return `${yy}-${mm}`;
+  };
+
+  const isCandidateActiveInMonth = (candidate: Candidate, month: string): boolean => {
+    const startDate = new Date(candidate.startDate);
+    const monthDate = new Date(month + '-01');
+    const endDate = candidate.endDate ? new Date(candidate.endDate) : null;
+    return startDate <= monthDate && (!endDate || endDate >= monthDate);
+  };
+
+  const hasExistingHoursInCycle = (candidateId: string, month: string): boolean => {
+    const key = `${candidateId}-${month}`;
+    const existsInLocal = originalHours.hasOwnProperty(key) || hoursData.hasOwnProperty(key);
+    const existsInCycle = (cycle.monthlyHours ?? []).some(h => h.candidateId === candidateId && h.month === month);
+    return existsInLocal || existsInCycle;
+  };
+
+  // Get active candidates for the cycle month (excluding already approved/processed months)
+  const getActiveCandidatesForMonth = (month: string) => {
+    const activeCandidates = candidates.filter(c => isCandidateActiveInMonth(c, month));
+    return activeCandidates.filter(c => !isCandidateMonthProcessed(c.candidateId, month, approvedCycles));
+  };
+
+  // Candidates who are pending hours for a given month (active, not processed, and no existing hours recorded for that month)
+  const getPendingCandidatesForMonth = (month: string): Candidate[] => {
+    const activeUnprocessed = getActiveCandidatesForMonth(month);
+    return activeUnprocessed.filter(c => !hasExistingHoursInCycle(c.candidateId, month));
+  };
+
+  // Get months to display in the dropdown: current month + any past months with pending candidates
+  const getMonthsWithPendingCandidates = () => {
+    const months = new Set<string>();
+    months.add(cycle.month);
+
+    // Do not include any month earlier than March of the cycle's year
+    const [cycleYear] = cycle.month.split('-');
+    const cutoffEarliestMonth = `${cycleYear}-03`;
+
+    // Look back up to 12 months for pending candidates
+    for (let i = 1; i <= 12; i++) {
+      const m = addMonths(cycle.month, -i);
+      if (m > cycle.month) continue; // safety, though should not happen
+      if (m < cutoffEarliestMonth) break; // do not go earlier than March
+      const pending = getPendingCandidatesForMonth(m);
+      if (pending.length > 0) {
+        months.add(m);
+      }
+    }
+
+    // Also include any months present in current cycle entries that still have pending candidates
+    const monthsInCycle = Array.from(new Set((cycle.monthlyHours ?? []).map(h => h.month)));
+    monthsInCycle.forEach(m => {
+      if (m <= cycle.month && m >= cutoffEarliestMonth) {
+        const pending = getPendingCandidatesForMonth(m);
+        if (pending.length > 0) months.add(m);
+      }
+    });
+
+    return Array.from(months).sort();
+  };
+
+  const monthsNeedingHours = getMonthsWithPendingCandidates();
+  const activeCandidatesForSelectedMonth = selectedMonth === cycle.month
+    ? getActiveCandidatesForMonth(selectedMonth)
+    : getPendingCandidatesForMonth(selectedMonth);
+  const filteredActiveCandidates = activeCandidatesForSelectedMonth.filter(candidate =>
+    candidate.candidateName.toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
+  // Get existing hours for selected month
+  const existingHoursForMonth = (cycle.monthlyHours ?? []).filter(h => h.month === selectedMonth);
+  const hasExistingHoursForMonth = existingHoursForMonth.length > 0;
+
+  return (
+    <>
+      <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+        <div className="bg-white rounded-lg shadow-xl max-w-5xl w-full max-h-screen overflow-y-auto">
+          <div className="sticky top-0 bg-white border-b px-6 py-4 flex items-center justify-between">
+            <div className="flex items-center space-x-3">
+              <Clock className="w-6 h-6 text-blue-600" />
+              <div>
+                <h2 className="text-xl font-semibold text-gray-900">
+                  {(cycle.monthlyHours ?? []).length > 0 ? 'Modify Hours' : 'Hours Entry'} - {formatMonth(cycle.month)}
+                </h2>
+                <p className="text-sm text-gray-500">
+                  Cycle ID: {cycle.id} • Including retroactive hours
+                  {(cycle.monthlyHours ?? []).length > 0 && (
+                    <span className="ml-2 px-2 py-1 bg-orange-100 text-orange-800 text-xs rounded-full">
+                      {(cycle.monthlyHours ?? []).length} existing entries
+                    </span>
+                  )}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center space-x-3">
+              <button
+                onClick={() => setShowManualEntry(true)}
+                className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors flex items-center space-x-2"
+              >
+                <Users className="w-4 h-4" />
+                <span>Manual Entry</span>
+              </button>
+              <button
+                onClick={() => setShowFileUpload(true)}
+                className="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition-colors flex items-center space-x-2"
+              >
+                <Upload className="w-4 h-4" />
+                <span>Upload File</span>
+              </button>
+              <button
+                onClick={onCancel}
+                className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+          </div>
+
+          <div className="p-6">
+            <div className="text-center py-12">
+              <Clock className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+              <h3 className="text-lg font-medium text-gray-900 mb-2">Choose Hours Entry Method</h3>
+              <p className="text-gray-500 mb-6">
+                Select how you would like to {(cycle.monthlyHours ?? []).length > 0 ? 'modify hours for' : 'add hours for'} this cycle
+              </p>
+              <div className="flex justify-center space-x-4">
+                <button
+                  onClick={() => setShowManualEntry(true)}
+                  className="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition-colors flex items-center space-x-2"
+                >
+                  <Users className="w-5 h-5" />
+                  <span>{(cycle.monthlyHours ?? []).length > 0 ? 'Manual Modification' : 'Manual Entry'}</span>
+                </button>
+                <button
+                  onClick={() => setShowFileUpload(true)}
+                  className="bg-green-600 text-white px-6 py-3 rounded-lg hover:bg-green-700 transition-colors flex items-center space-x-2"
+                >
+                  <Upload className="w-5 h-5" />
+                  <span>{(cycle.monthlyHours ?? []).length > 0 ? 'Upload New File' : 'Upload File'}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Manual Entry Modal */}
+      {showManualEntry && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-lg shadow-xl max-w-6xl w-full max-h-screen overflow-y-auto">
+            <div className="sticky top-0 bg-white border-b px-6 py-4 flex items-center justify-between">
+              <div className="flex items-center space-x-3">
+                <Users className="w-6 h-6 text-blue-600" />
+                <div>
+                  <h2 className="text-xl font-semibold text-gray-900">
+                    {(cycle.monthlyHours ?? []).length > 0 ? 'Manual Hours Modification' : 'Manual Hours Entry'}
+                  </h2>
+                  <p className="text-sm text-gray-500">
+                    {(cycle.monthlyHours ?? []).length > 0 ? 'Modify existing hours or add new entries' : 'Enter hours for each candidate manually'}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowManualEntry(false)}
+                className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmit} className="p-6 space-y-6">
+              {/* Month Selection and Search Bar */}
+              <div className="bg-blue-50 p-4 rounded-lg flex flex-col md:flex-row md:items-end md:space-x-4">
+                <div className="flex-1">
+                  <label className="block text-sm font-medium text-blue-900 mb-2">Select Month</label>
+                  <select
+                    value={selectedMonth}
+                    onChange={(e) => setSelectedMonth(e.target.value)}
+                    className="w-full px-3 py-2 border border-blue-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white"
+                  >
+                    {monthsNeedingHours.map(month => (
+                      <option key={month} value={month}>
+                        {formatMonth(month)}
+                        {month !== cycle.month && ' (Retroactive)'}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="mt-4 md:mt-0 md:w-1/3">
+                  <label className="block text-sm font-medium text-blue-900 mb-2">Search Candidate</label>
+                  <input
+                    type="text"
+                    placeholder="Search by name..."
+                    value={searchTerm}
+                    onChange={e => setSearchTerm(e.target.value)}
+                    className="w-full px-3 py-2 border border-blue-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white"
+                  />
+                </div>
+              </div>
+
+              {/* Candidates Hours Entry */}
+              <div className="space-y-4">
+                <h3 className="text-lg font-semibold text-gray-900">
+                  Active Candidates for {formatMonth(selectedMonth)}
+                </h3>
+
+                {filteredActiveCandidates.length === 0 ? (
+                  <div className="text-center py-8 bg-gray-50 rounded-lg">
+                    <Users className="w-12 h-12 text-gray-300 mx-auto mb-3" />
+                    <p className="text-gray-500">No active candidates found for this month</p>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="min-w-full divide-y divide-gray-200">
+                      <thead className="bg-gray-50">
+                        <tr>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Candidate Name</th>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Candidate ID</th>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Client Name</th>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Contract Type</th>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Hours Worked</th>
+                        </tr>
+                      </thead>
+                      <tbody className="bg-white divide-y divide-gray-100">
+                        {filteredActiveCandidates.map(candidate => {
+                          const key = `${candidate.candidateId}-${selectedMonth}`;
+                          const currentHours = hoursData[key] || originalHours[key] || 0;
+                          return (
+                            <tr key={candidate.candidateId}>
+                              <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-900">{candidate.candidateName}</td>
+                              <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500">{candidate.candidateId}</td>
+                              <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500">{candidate.clientName}</td>
+                              <td className="px-4 py-2 whitespace-nowrap text-sm">
+                                <span className={`inline-block px-2 py-1 text-xs font-medium rounded-full ${candidate.contractType === 'FULLTIME'
+                                  ? 'bg-purple-100 text-purple-800'
+                                  : candidate.contractType === 'W2'
+                                    ? 'bg-blue-100 text-blue-800'
+                                    : 'bg-green-100 text-green-800'
+                                }`}>
+                                  {candidate.contractType}
+                                </span>
+                              </td>
+                              <td className="px-4 py-2 whitespace-nowrap text-sm">
+                                <input
+                                  type="number"
+                                  min="0"
+                                  max="744"
+                                  step="0.5"
+                                  value={currentHours}
+                                  onChange={(e) => handleHoursChange(candidate.candidateId, selectedMonth, parseFloat(e.target.value) || 0)}
+                                  className="w-24 px-2 py-1 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                  placeholder="Enter hours"
+                                />
+                                {candidate.contractType === 'FULLTIME' && currentHours > 0 && (
+                                  <p className="text-xs text-purple-600 mt-1">Full-time placement recorded</p>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              {/* Existing Hours Display */}
+              {hasExistingHoursForMonth && (
+                <div className="bg-orange-50 border border-orange-200 rounded-lg p-4">
+                  <h4 className="font-medium text-orange-900 mb-3 flex items-center">
+                    <Edit className="w-4 h-4 mr-2" />
+                    Existing Hours for {formatMonth(selectedMonth)} (Click to modify)
+                  </h4>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                    {existingHoursForMonth.map((hours, index) => {
+                      const candidate = candidates.find(c => c.candidateId === hours.candidateId);
+                      const key = `${hours.candidateId}-${selectedMonth}`;
+                      const currentHours = hoursData[key] !== undefined ? hoursData[key] : hours.hoursWorked;
+
+                      return (
+                        <div key={index} className="bg-white border border-orange-300 rounded p-3 hover:shadow-md transition-shadow">
+                          <div className="font-medium text-gray-900">{candidate?.candidateName || 'Unknown'}</div>
+                          <div className="text-sm text-gray-600">{hours.candidateId}</div>
+                          <div className="mt-2">
+                            <label className="block text-xs text-gray-500 mb-1">Hours Worked</label>
+                            <input
+                              type="number"
+                              min="0"
+                              max="744"
+                              step="0.5"
+                              value={currentHours}
+                              onChange={(e) => handleHoursChange(hours.candidateId, selectedMonth, parseFloat(e.target.value) || 0)}
+                              className="w-full px-2 py-1 border border-orange-300 rounded focus:ring-2 focus:ring-orange-500 focus:border-transparent text-sm"
+                            />
+                            {currentHours !== hours.hoursWorked && (
+                              <p className="text-xs text-blue-600 mt-1">
+                                Changed from {hours.hoursWorked} hours
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="mt-3 p-2 bg-blue-50 border border-blue-200 rounded">
+                    <p className="text-xs text-blue-700">
+                      <strong>Note:</strong> Modifying hours will automatically recalculate incentives when you save.
+                      Changes will be reflected in the next incentive calculation.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Retroactive Notice */}
+              {selectedMonth !== cycle.month && (
+                <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+                  <div className="flex items-center space-x-2">
+                    <AlertCircle className="w-5 h-5 text-yellow-600" />
+                    <h4 className="font-medium text-yellow-900">Retroactive Hours Entry</h4>
+                  </div>
+                  <p className="text-yellow-700 text-sm mt-1">
+                    You are adding hours for {formatMonth(selectedMonth)}, which is a previous month.
+                    These will be processed as retroactive hours in the current cycle.
+                  </p>
+                </div>
+              )}
+
+              <div className="flex justify-end space-x-4 border-t pt-6">
+                <button
+                  type="button"
+                  onClick={() => setShowManualEntry(false)}
+                  className="px-6 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition-colors flex items-center space-x-2"
+                  disabled={mutation.status === 'pending'}
+                >
+                  {mutation.status === 'pending' ? (
+                    <svg className="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                  ) : (
+                    <Save className="w-4 h-4" />
+                  )}
+                  <span>{(cycle.monthlyHours ?? []).length > 0 ? 'Update Hours' : 'Save Hours'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      {showFileUpload && (
+        <FileUploadModal
+          cycleId={cycle.id}
+          cycleMonth={selectedMonth}
+          candidates={candidates}
+          approvedCycles={approvedCycles}
+          onSave={handleFileUploadSave}
+          onClose={() => setShowFileUpload(false)}
+        />
+      )}
+    </>
+  );
+};
